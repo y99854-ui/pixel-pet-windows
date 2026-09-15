@@ -29,7 +29,7 @@ if ($EnsureShortcut) {
         if ([string]::IsNullOrWhiteSpace($installDirectory)) {
             $installDirectory = Join-Path $env:LOCALAPPDATA "PixelCatPet\app"
         }
-        $launcherVersion = "6718.2"
+        $launcherVersion = "6719"
         $firstLaunchMarker = Join-Path $installDirectory "unified-launcher.ready"
         $installedVersion = ""
         if (Test-Path -LiteralPath $firstLaunchMarker) {
@@ -1197,14 +1197,32 @@ function Reset-BottomPose {
     Set-PetTransform 1 1 0
 }
 
-$matPalette = @{
-    Outline = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#68506F")
-    Side = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#A17CA5")
-    Top = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#D7B9D7")
-    Highlight = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#F1DDEA")
+# Each character has a fixed cushion palette (outline, side, top, highlight).
+$matColors = @{
+    GrayCat = @("#365B79", "#689AC3", "#A8D5EE", "#DDF2FF")
+    Corgi = @("#356452", "#69A88D", "#AFE0C7", "#DDF7E9")
+    Hamster = @("#8B6139", "#C89550", "#F0CE85", "#FFF0C3")
+    TuxCorgi = @("#785063", "#BE819A", "#E9B8CB", "#FFE0EC")
+    BlackCat = @("#68506F", "#A17CA5", "#D7B9D7", "#F1DDEA")
+    FlowerBloom = @("#864F42", "#CA8569", "#F1B99A", "#FFE1C9")
 }
+$matPalettes = @{}
+foreach ($style in $matColors.Keys) {
+    $colors = $matColors[$style]
+    $brushes = @{}
+    $names = @("Outline", "Side", "Top", "Highlight")
+    for ($i = 0; $i -lt $names.Count; $i++) {
+        $brush = [System.Windows.Media.BrushConverter]::new().ConvertFromString($colors[$i])
+        $brush.Freeze()
+        $brushes[$names[$i]] = $brush
+    }
+    $matPalettes[$style] = $brushes
+}
+$matPalettes.Aussie = $matPalettes.FlowerBloom
 
 function Draw-SleepingMat {
+    $matPalette = $matPalettes[$script:petStyle]
+    if ($null -eq $matPalette) { $matPalette = $matPalettes.GrayCat }
     # A low, rounded pixel cushion. The top supports the paws at y=192;
     # its padded side rests on the work-area edge at y=204.
     $firstMatIndex = $canvas.Children.Count
@@ -2004,7 +2022,7 @@ if ($SelfTest) {
     Clamp-ToWorkArea
     Draw-Pet 0 $false 0 $false
     $window.Hide()
-    Write-Output "6718 bottom-edge checks passed for all six pets."
+    Write-Output "6719 bottom-edge checks passed for all six pets."
 
     if ($script:opacityItems.Count -ne $opacityLevels.Count) { throw "Opacity menu is incomplete." }
     if (($script:opacityItems | Where-Object { $_.IsChecked }).Count -ne 1) { throw "Opacity menu must have exactly one selected level." }
