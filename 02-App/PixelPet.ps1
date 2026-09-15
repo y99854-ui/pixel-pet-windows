@@ -29,7 +29,7 @@ if ($EnsureShortcut) {
         if ([string]::IsNullOrWhiteSpace($installDirectory)) {
             $installDirectory = Join-Path $env:LOCALAPPDATA "PixelCatPet\app"
         }
-        $launcherVersion = "6718"
+        $launcherVersion = "6718.1"
         $firstLaunchMarker = Join-Path $installDirectory "unified-launcher.ready"
         $installedVersion = ""
         if (Test-Path -LiteralPath $firstLaunchMarker) {
@@ -94,9 +94,53 @@ if ($EnsureShortcut) {
     }
 }
 
-Add-Type @"
+Add-Type -ReferencedAssemblies @("System.dll", "System.Xaml.dll", [System.Windows.Window].Assembly.Location, [System.Windows.Media.Visual].Assembly.Location, [System.Windows.Threading.Dispatcher].Assembly.Location) -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
+
+// Keep unmanaged window callbacks entirely in managed C#; a callback can arrive
+// outside PowerShell's runspace, including during native window teardown.
+public sealed class PixelPetWindowBridge
+{
+    private readonly System.Windows.Controls.Canvas stage;
+    public bool DisplayOn { get; private set; }
+    public readonly System.Windows.Interop.HwndSourceHook Hook;
+
+    public PixelPetWindowBridge(System.Windows.Controls.Canvas stage)
+    {
+        this.stage = stage;
+        DisplayOn = true;
+        Hook = HandleMessage;
+    }
+
+    private IntPtr HandleMessage(IntPtr hwnd, int message, IntPtr wParam,
+        IntPtr lParam, ref bool handled)
+    {
+        if (message == 0x0084 && stage.Dispatcher.CheckAccess())
+        {
+            int x, y;
+            if (PixelPetNative.TryGetCursorPosition(out x, out y))
+            {
+                try
+                {
+                    var point = stage.PointFromScreen(new System.Windows.Point(x, y));
+                    if (System.Windows.Media.VisualTreeHelper.HitTest(stage, point) == null)
+                    {
+                        handled = true;
+                        return new IntPtr(-1);
+                    }
+                }
+                catch (InvalidOperationException) { /* Visual disconnected during teardown. */ }
+            }
+        }
+        if (message == 0x0218 && wParam.ToInt64() == 0x8013 && lParam != IntPtr.Zero)
+        {
+            DisplayOn = Marshal.ReadInt32(lParam, 20) != 0;
+            handled = true;
+        }
+        return IntPtr.Zero;
+    }
+}
 
 public static class PixelPetNative
 {
@@ -1212,7 +1256,7 @@ function Complete-PetDrag {
 }
 
 function Test-InteractiveDisplay {
-    return ($script:displayOn -and [PixelPetNative]::IsSessionUnlocked())
+    return (($null -eq $script:windowBridge -or $script:windowBridge.DisplayOn) -and [PixelPetNative]::IsSessionUnlocked())
 }
 
 function Update-PetIdentityText {
@@ -1697,43 +1741,10 @@ function Hide-HourlyPet {
 }
 
 $window.Add_SourceInitialized({
-    if ($SelfTest) { return }
     $helper = New-Object System.Windows.Interop.WindowInteropHelper($window)
     $script:windowSource = [System.Windows.Interop.HwndSource]::FromHwnd($helper.Handle)
-    $script:windowHook = [System.Windows.Interop.HwndSourceHook]{
-        param([IntPtr]$hWnd, [int]$message, [IntPtr]$wParam, [IntPtr]$lParam, [ref]$handled)
-
-        $WM_POWERBROADCAST = 0x0218
-        $PBT_POWERSETTINGCHANGE = 0x8013
-        $WM_NCHITTEST = 0x0084
-        $HTTRANSPARENT = -1
-
-        if ($message -eq $WM_NCHITTEST) {
-            $cursorX = 0
-            $cursorY = 0
-            if ([PixelPetNative]::TryGetCursorPosition([ref]$cursorX, [ref]$cursorY)) {
-                try {
-                    $screenPoint = New-Object System.Windows.Point([double]$cursorX, [double]$cursorY)
-                    $stagePoint = $stage.PointFromScreen($screenPoint)
-                    $hit = [System.Windows.Media.VisualTreeHelper]::HitTest($stage, $stagePoint)
-                    if ($null -eq $hit) {
-                        $handled.Value = $true
-                        return [IntPtr]$HTTRANSPARENT
-                    }
-                } catch {
-                    # Fall through to standard hit testing during window teardown.
-                }
-            }
-        }
-
-        if (($message -eq $WM_POWERBROADCAST) -and ($wParam.ToInt64() -eq $PBT_POWERSETTINGCHANGE)) {
-            # POWERBROADCAST_SETTING stores its DWORD/byte data after GUID + length.
-            $displayState = [System.Runtime.InteropServices.Marshal]::ReadInt32($lParam, 20)
-            $script:displayOn = ($displayState -ne 0)
-            $handled.Value = $true
-        }
-        return [IntPtr]::Zero
-    }
+    $script:windowBridge = New-Object PixelPetWindowBridge($stage)
+    $script:windowHook = $script:windowBridge.Hook
     $script:windowSource.AddHook($script:windowHook)
 
     $displayStatusGuid = [Guid]"2b84c20e-ad23-4ddf-93db-05ffbd7efca5"
@@ -1917,6 +1928,8 @@ Draw-Pet 0 $false 0 $false
 if ($SelfTest) {
     $window.Show()
     $window.UpdateLayout()
+    if ($null -eq $script:windowBridge -or $null -eq $script:windowHook) { throw "Native callback was not installed during self-test." }
+    if ($script:windowHook.Method.DeclaringType -ne [PixelPetWindowBridge]) { throw "Native callback must not execute a PowerShell script block." }
     $dockWork = [System.Windows.SystemParameters]::WorkArea
     $dockX = $dockWork.Left + 100
     $originalStyle = $script:petStyle
