@@ -29,7 +29,7 @@ if ($EnsureShortcut) {
         if ([string]::IsNullOrWhiteSpace($installDirectory)) {
             $installDirectory = Join-Path $env:LOCALAPPDATA "PixelCatPet\app"
         }
-        $launcherVersion = "6718.1"
+        $launcherVersion = "6718.2"
         $firstLaunchMarker = Join-Path $installDirectory "unified-launcher.ready"
         $installedVersion = ""
         if (Test-Path -LiteralPath $firstLaunchMarker) {
@@ -1197,6 +1197,30 @@ function Reset-BottomPose {
     Set-PetTransform 1 1 0
 }
 
+$matPalette = @{
+    Outline = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#68506F")
+    Side = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#A17CA5")
+    Top = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#D7B9D7")
+    Highlight = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#F1DDEA")
+}
+
+function Draw-SleepingMat {
+    # A low, rounded pixel cushion. The top supports the paws at y=192;
+    # its padded side rests on the work-area edge at y=204.
+    $firstMatIndex = $canvas.Children.Count
+    Add-PixelRect 2 30 32 4 $matPalette.Outline
+    Add-PixelRect 0 31 36 2 $matPalette.Outline
+    Add-PixelRect 2 31 32 2 $matPalette.Side
+    Add-PixelRect 3 30 30 2 $matPalette.Top
+    Add-PixelRect 1 31 34 1 $matPalette.Top
+    Add-PixelRect 4 30 28 1 $matPalette.Highlight
+    Add-PixelRect 3 32 30 1 $matPalette.Side
+    for ($index = $firstMatIndex; $index -lt $canvas.Children.Count; $index++) {
+        [System.Windows.Controls.Panel]::SetZIndex($canvas.Children[$index], -1)
+        $canvas.Children[$index].Tag = "SleepingMat"
+    }
+}
+
 function Draw-BottomPose {
     $resting = $script:bottomPose -eq "Rest"
     $blink = $resting -or ($script:tick -le $script:blinkUntil)
@@ -1219,14 +1243,15 @@ function Draw-BottomPose {
         [System.Windows.Controls.Canvas]::SetTop($rect, $newY)
         $rect.Height = $newEnd - $newY
     }
-    # Anchor the visible paws, rather than transparent canvas padding, to the edge.
+    # Anchor paws to the cushion surface; the cushion itself touches the edge.
     $lowest = 0.0
     foreach ($rect in $canvas.Children) {
         $lowest = [Math]::Max($lowest, [System.Windows.Controls.Canvas]::GetTop($rect) + $rect.Height)
     }
     foreach ($rect in $canvas.Children) {
-        [System.Windows.Controls.Canvas]::SetTop($rect, ([System.Windows.Controls.Canvas]::GetTop($rect) + $petHeight - $lowest))
+        [System.Windows.Controls.Canvas]::SetTop($rect, ([System.Windows.Controls.Canvas]::GetTop($rect) + $petHeight - 12 - $lowest))
     }
+    Draw-SleepingMat
 }
 
 function Complete-PetDrag {
@@ -1941,6 +1966,15 @@ if ($SelfTest) {
         Set-PetPosition $dockX ($dockWork.Bottom - $petHeight - 12)
         Complete-PetDrag
         if ($script:bottomPose -ne "Rest") { throw "First contact must rest: $style" }
+        $matRects = @($canvas.Children | Where-Object { $_.Tag -eq "SleepingMat" })
+        if ($matRects.Count -ne 7) { throw "Sleeping mat missing for $style" }
+        $pawBottom = 0.0
+        foreach ($rect in $canvas.Children) {
+            if ($rect.Tag -ne "SleepingMat") {
+                $pawBottom = [Math]::Max($pawBottom, [System.Windows.Controls.Canvas]::GetTop($rect) + $rect.Height)
+            }
+        }
+        if ([Math]::Abs($pawBottom - ($petHeight - 12)) -gt 0.01) { throw "Paws do not rest on the mat: $style" }
         if ($script:outsideSwitchActive -or $script:centerReturnActive) { throw "Bottom contact triggered old edge action." }
         $lowest = 0.0
         foreach ($rect in $canvas.Children) {
