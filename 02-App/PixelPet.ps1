@@ -1,6 +1,7 @@
-param(
+﻿param(
     [switch]$SelfTest,
     [string]$PreviewPath = "",
+    [ValidateSet("None", "Rest", "Peek")][string]$EdgePose = "None",
     [switch]$Hourly,
     [double]$IntervalMinutes = 60,
     [int]$ShowSeconds = 30,
@@ -28,7 +29,7 @@ if ($EnsureShortcut) {
         if ([string]::IsNullOrWhiteSpace($installDirectory)) {
             $installDirectory = Join-Path $env:LOCALAPPDATA "PixelCatPet\app"
         }
-        $launcherVersion = "6717"
+        $launcherVersion = "6718"
         $firstLaunchMarker = Join-Path $installDirectory "unified-launcher.ready"
         $installedVersion = ""
         if (Test-Path -LiteralPath $firstLaunchMarker) {
@@ -1108,6 +1109,10 @@ $script:appearancePending = $false
 $script:appearanceRemaining = [TimeSpan]::FromSeconds($ShowSeconds)
 $script:lastVisibilityCheck = [DateTime]::UtcNow
 $script:nextAppearance = [DateTime]::UtcNow.AddMinutes($IntervalMinutes)
+$script:bottomPose = "None"
+$script:nextBottomPose = "Rest"
+$script:bottomDragActive = $false
+$script:bottomDragDetached = $false
 $script:outsideSwitchActive = $false
 $script:outsideSwitchPhase = "Idle"
 $script:outsideSwitchPhaseStarted = [DateTime]::UtcNow
@@ -1136,13 +1141,83 @@ $petEyeBounds = @{
 }
 $stopRequestPath = Join-Path $settingsDirectory "stop.request"
 
+function Test-BottomContact {
+    $work = [System.Windows.SystemParameters]::WorkArea
+    $centerX = (Get-PetLeft) + $petWidth / 2
+    return ($centerX -ge $work.Left -and $centerX -le $work.Right -and
+        ((Get-PetTop) + $petHeight) -ge ($work.Bottom - 18))
+}
+
+function Reset-BottomPose {
+    $script:bottomPose = "None"
+    Set-PetTransform 1 1 0
+}
+
+function Draw-BottomPose {
+    $resting = $script:bottomPose -eq "Rest"
+    $blink = $resting -or ($script:tick -le $script:blinkUntil)
+    Draw-Pet 0 $blink 0 $false
+    # Preserve each character's face; lower its head and fold the body beneath it.
+    $bounds = Get-CurrentPetEyeBounds
+    $look = if (($script:tick % 100) -lt 50) { -3.0 } else { 3.0 }
+    foreach ($rect in @($canvas.Children)) {
+        if ($rect.Fill -eq $palette.Shadow) { $canvas.Children.Remove($rect); continue }
+        $x = [System.Windows.Controls.Canvas]::GetLeft($rect)
+        $y = [System.Windows.Controls.Canvas]::GetTop($rect)
+        if (-not $resting -and -not $blink -and $rect.Fill -eq $palette.Dark -and
+            $x -ge $bounds.Left -and ($x + $rect.Width) -le $bounds.Right -and
+            $y -ge $bounds.Top -and ($y + $rect.Height) -le $bounds.Bottom) {
+            [System.Windows.Controls.Canvas]::SetLeft($rect, ($x + $look))
+        }
+        $end = $y + $rect.Height
+        $newY = if ($y -le 138) { 75 + $y * 0.72 } else { 174.36 + ($y - 138) * 0.46 }
+        $newEnd = if ($end -le 138) { 75 + $end * 0.72 } else { 174.36 + ($end - 138) * 0.46 }
+        [System.Windows.Controls.Canvas]::SetTop($rect, $newY)
+        $rect.Height = $newEnd - $newY
+    }
+    # Anchor the visible paws, rather than transparent canvas padding, to the edge.
+    $lowest = 0.0
+    foreach ($rect in $canvas.Children) {
+        $lowest = [Math]::Max($lowest, [System.Windows.Controls.Canvas]::GetTop($rect) + $rect.Height)
+    }
+    foreach ($rect in $canvas.Children) {
+        [System.Windows.Controls.Canvas]::SetTop($rect, ([System.Windows.Controls.Canvas]::GetTop($rect) + $petHeight - $lowest))
+    }
+}
+
+function Complete-PetDrag {
+    if (Test-BottomContact) {
+        if ($script:bottomPose -eq "None" -or $script:bottomDragDetached) {
+            $script:bottomPose = $script:nextBottomPose
+            $script:nextBottomPose = if ($script:bottomPose -eq "Rest") { "Peek" } else { "Rest" }
+        }
+        $work = [System.Windows.SystemParameters]::WorkArea
+        Set-PetPosition ([Math]::Max($work.Left, [Math]::Min((Get-PetLeft), $work.Right - $petWidth))) ($work.Bottom - $petHeight)
+        $script:floorTop = Get-PetTop
+        Draw-BottomPose
+        return
+    }
+    Reset-BottomPose
+    $outsideEdge = Get-PetOutsideEdge
+    $crossedEdge = Get-PetCrossedEdge
+    if (-not [string]::IsNullOrWhiteSpace($outsideEdge)) {
+        Start-OutsidePetSwitch $outsideEdge
+    } elseif (-not [string]::IsNullOrWhiteSpace($crossedEdge)) {
+        Start-CenterReturn $crossedEdge
+    } else {
+        Clamp-ToWorkArea
+        $script:floorTop = Get-PetTop
+    }
+    Draw-Pet 0 $false 0 $false
+}
+
 function Test-InteractiveDisplay {
     return ($script:displayOn -and [PixelPetNative]::IsSessionUnlocked())
 }
 
 function Update-PetIdentityText {
     $window.Title = "Pixel Pet - $($petNames[$script:petStyle])"
-    $window.ToolTip = "$($petNames[$script:petStyle]) | Hide both eyes off-screen to switch | Partial edge drag rolls to center | Double-click to pet | Right-click for menu"
+    $window.ToolTip = "$($petNames[$script:petStyle]) | Bottom edge: rest / peek | Other edges: hide both eyes to switch | Double-click to pet | Right-click for menu"
 }
 
 function Save-CurrentStyleIndex {
@@ -1622,6 +1697,7 @@ function Hide-HourlyPet {
 }
 
 $window.Add_SourceInitialized({
+    if ($SelfTest) { return }
     $helper = New-Object System.Windows.Interop.WindowInteropHelper($window)
     $script:windowSource = [System.Windows.Interop.HwndSource]::FromHwnd($helper.Handle)
     $script:windowHook = [System.Windows.Interop.HwndSourceHook]{
@@ -1678,6 +1754,7 @@ $topmostItem.Add_Click({
 })
 
 $homeItem.Add_Click({
+    Reset-BottomPose
     Reset-CenterReturn
     Reset-OutsidePetSwitch
     $work = [System.Windows.SystemParameters]::WorkArea
@@ -1690,10 +1767,21 @@ $exitItem.Add_Click({
     $window.Close()
 })
 
+$window.Add_LocationChanged({
+    if ($script:bottomDragActive) {
+        $work = [System.Windows.SystemParameters]::WorkArea
+        if (((Get-PetTop) + $petHeight) -lt ($work.Bottom - 40)) {
+            $script:bottomDragDetached = $true
+        }
+    }
+})
+
 $canvas.Add_MouseLeftButtonDown({
     param($sender, $eventArgs)
 
     if ($eventArgs.ClickCount -ge 2) {
+        Reset-BottomPose
+        Draw-Pet 0 $false 0 $false
         Start-SuperJump
         $eventArgs.Handled = $true
         return
@@ -1708,20 +1796,15 @@ $canvas.Add_MouseLeftButtonDown({
     $timerWasEnabled = $timer.IsEnabled
     if ($timerWasEnabled) { $timer.Stop() }
     try {
+        $script:bottomDragDetached = $false
+        $script:bottomDragActive = $true
         $window.DragMove()
-        $outsideEdge = Get-PetOutsideEdge
-        $crossedEdge = Get-PetCrossedEdge
-        if (-not [string]::IsNullOrWhiteSpace($outsideEdge)) {
-            Start-OutsidePetSwitch $outsideEdge
-        } elseif (-not [string]::IsNullOrWhiteSpace($crossedEdge)) {
-            Start-CenterReturn $crossedEdge
-        } else {
-            Clamp-ToWorkArea
-            $script:floorTop = Get-PetTop
-        }
+        $script:bottomDragActive = $false
+        Complete-PetDrag
     } catch {
         # DragMove can be interrupted if the mouse is released immediately.
     } finally {
+        $script:bottomDragActive = $false
         if ($timerWasEnabled -and $window.IsVisible) { $timer.Start() }
         $eventArgs.Handled = $true
     }
@@ -1742,6 +1825,11 @@ $timer.Add_Tick({
     if ($script:tick -ge $script:nextBlink) {
         $script:blinkUntil = $script:tick + 2
         $script:nextBlink = $script:tick + (Get-Random -Minimum 35 -Maximum 95)
+    }
+
+    if ($script:bottomPose -ne "None") {
+        Draw-BottomPose
+        return
     }
 
     if ($script:centerReturnActive) {
@@ -1827,6 +1915,50 @@ $window.Add_Closing({
 Draw-Pet 0 $false 0 $false
 
 if ($SelfTest) {
+    $window.Show()
+    $window.UpdateLayout()
+    $dockWork = [System.Windows.SystemParameters]::WorkArea
+    $dockX = $dockWork.Left + 100
+    $originalStyle = $script:petStyle
+    foreach ($style in @("GrayCat", "Corgi", "Hamster", "TuxCorgi", "BlackCat", "FlowerBloom")) {
+        $script:petStyle = $style
+        Reset-BottomPose
+        $script:nextBottomPose = "Rest"
+        $script:bottomDragDetached = $false
+        Set-PetPosition $dockX ($dockWork.Bottom - $petHeight - 12)
+        Complete-PetDrag
+        if ($script:bottomPose -ne "Rest") { throw "First contact must rest: $style" }
+        if ($script:outsideSwitchActive -or $script:centerReturnActive) { throw "Bottom contact triggered old edge action." }
+        $lowest = 0.0
+        foreach ($rect in $canvas.Children) {
+            $lowest = [Math]::Max($lowest, [System.Windows.Controls.Canvas]::GetTop($rect) + $rect.Height)
+        }
+        if ([Math]::Abs((Get-PetTop) + $lowest - $dockWork.Bottom) -gt 0.01) { throw "Paws must touch bottom: $style" }
+        Complete-PetDrag
+        if ($script:bottomPose -ne "Rest") { throw "Sliding must not toggle." }
+        $script:bottomDragActive = $true
+        Set-PetPosition $dockX ($dockWork.Bottom - $petHeight - 60)
+        $script:bottomDragActive = $false
+        if (-not $script:bottomDragDetached) { throw "Location tracking did not detect detachment." }
+        Set-PetPosition $dockX ($dockWork.Bottom - $petHeight)
+        Complete-PetDrag
+        if ($script:bottomPose -ne "Peek") { throw "Return must peek." }
+        $script:bottomDragDetached = $false
+        Set-PetPosition $dockX ($dockWork.Bottom - $petHeight - 100)
+        Complete-PetDrag
+        if ($script:bottomPose -ne "None") { throw "Dragging away must undock." }
+        Set-PetPosition $dockX ($dockWork.Bottom + 10)
+        Complete-PetDrag
+        if ($script:bottomPose -ne "Rest") { throw "Deep bottom drag must rest." }
+    }
+    $script:petStyle = $originalStyle
+    Reset-BottomPose
+    $script:nextBottomPose = "Rest"
+    Clamp-ToWorkArea
+    Draw-Pet 0 $false 0 $false
+    $window.Hide()
+    Write-Output "6718 bottom-edge checks passed for all six pets."
+
     if ($script:opacityItems.Count -ne $opacityLevels.Count) { throw "Opacity menu is incomplete." }
     if (($script:opacityItems | Where-Object { $_.IsChecked }).Count -ne 1) { throw "Opacity menu must have exactly one selected level." }
     if ([Math]::Abs($window.Opacity - $script:petOpacity) -gt 0.001) { throw "Window opacity does not match the selected level." }
@@ -1973,6 +2105,7 @@ if ($Hourly -and -not $SelfTest -and [string]::IsNullOrWhiteSpace($PreviewPath))
 }
 
 if (-not [string]::IsNullOrWhiteSpace($PreviewPath)) {
+    if ($EdgePose -ne "None") { $script:bottomPose = $EdgePose; Draw-BottomPose }
     $window.Show()
     $window.UpdateLayout()
     $bitmap = New-Object System.Windows.Media.Imaging.RenderTargetBitmap(
